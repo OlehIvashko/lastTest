@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# deploy.sh  -- run Cloud9
+
+set -euo pipefail
+
+# ⚙️  Update!!!
+AWS_REGION="eu-central-1"
+ECR_REPO="lasttest-bg-removal"
+LAMBDA_NAME="bg-removal"
+ROLE_NAME="lambda-bg-removal-role"
+
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+echo "🛠  1/6  ECR login"
+aws ecr describe-repositories --repository-names "$ECR_REPO" --region "$AWS_REGION" \
+  || aws ecr create-repository --repository-name "$ECR_REPO" --region "$AWS_REGION"
+
+aws ecr get-login-password --region "$AWS_REGION" | \
+  docker login --username AWS --password-stdin "$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+
+echo "📦  2/6  Docker build"
+docker build -t "$ECR_REPO":latest .
+
+echo "⬆️   3/6  Push to ECR"
+docker tag "$ECR_REPO":latest "$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO":latest
+docker push      "$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO":latest
+
+echo "🔐  4/6  IAM role"
+aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1 || {
+  aws iam create-role --role-name "$ROLE_NAME" \
+    --assume-role-policy-document file://trust-lambda.json
+  aws iam attach-role-policy --role-name "$ROLE_NAME" \
+    --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+}
+
+ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$ROLE_NAME"
+
+echo "λ   5/6  Lambda create/update"
+aws lambda get-function --function-name "$LAMBDA_NAME" --region "$AWS_REGION" >/dev/null 2>&1 && \
+  aws lambda update-function-code \
+    --function-name "$LAMBDA_NAME" \
+    --image-uri "$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO":latest \
+    --region "$AWS_REGION" \
+  || aws lambda create-function \
+    --function-name "$LAMBDA_NAME" \
+    --package-type Image \
+    --code ImageUri="$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO":latest \
+    --role "$ROLE_ARN" \
+    --memory-size 2048 --timeout 120 \
+    --region "$AWS_REGION"
+
+echo "🌐  6/6  API Gateway HTTP API"
+API_ID=$(aws apigatewayv2 get-apis --region "$AWS_REGION" \
+           --query "Items[?Name=='${LAMBDA_NAME}-http'].ApiId" --output text)
+
+if [[ -z "$API_ID" ]]; then
+  API_ID=$(aws apigatewayv2 create-api \
+              --name "${LAMBDA_NAME}-http" --protocol-type HTTP \
+              --target "arn:aws:lambda:$AWS_REGION:$ACCOUNT_ID:function:$LAMBDA_NAME" \
+              --region "$AWS_REGION" --query ApiId --output text)
+  echo "   🔗  Invoke URL → https://${API_ID}.execute-api.${AWS_REGION}.amazonaws.com/"
+else
+  echo "   API exist → https://${API_ID}.execute-api.${AWS_REGION}.amazonaws.com/"
+fi
+
+echo "✅  Done"

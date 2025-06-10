@@ -1,0 +1,9 @@
+# lambda_handler.py
+import awsgi
+from app import app
+
+def lambda_handler(event, context):
+    """
+    AWS Lambda entry-point.
+    """
+    return awsgi.response(app, event, context)
